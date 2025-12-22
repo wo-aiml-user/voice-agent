@@ -432,19 +432,21 @@ function App() {
           </div>
         )}
 
-        {/* Streaming LLM response */}
-        {isStreaming && streamingResponse && (
+        {/* Live streaming response - shown during LLM streaming OR TTS playback */}
+        {(isStreaming || isAssistantSpeaking) && streamingResponse && (
           <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-4">
             <div className="flex items-start space-x-2">
-              <span className="text-purple-400 text-sm">Assistant:</span>
+              <span className="text-purple-400 text-sm">
+                {isAssistantSpeaking ? '🔊 Assistant:' : 'Assistant:'}
+              </span>
               <span className="text-white">{streamingResponse}</span>
               <span className="animate-pulse text-purple-400">▋</span>
             </div>
           </div>
         )}
 
-        {/* Final response (when not streaming) */}
-        {response && !isStreaming && <ResponseBubble response={response} />}
+        {/* Final response (when not streaming and not speaking) */}
+        {response && !isStreaming && !isAssistantSpeaking && <ResponseBubble response={response} />}
 
         {isProcessing && !streamingResponse && (
           <div className="flex justify-center">
@@ -453,17 +455,6 @@ function App() {
                 <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
                 <span>🧠 Thinking...</span>
               </div>
-            </div>
-          </div>
-        )}
-
-        {/* Show when assistant is speaking */}
-        {isAssistantSpeaking && streamingResponse && (
-          <div className="bg-white/10 backdrop-blur-sm rounded-2xl p-4">
-            <div className="flex items-start space-x-2">
-              <span className="text-purple-400 text-sm">🔊 Assistant:</span>
-              <span className="text-white">{streamingResponse}</span>
-              <span className="animate-pulse text-purple-400">▋</span>
             </div>
           </div>
         )}

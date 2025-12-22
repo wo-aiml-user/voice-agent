@@ -18,7 +18,7 @@ from deepgram import (
     LiveTranscriptionEvents,
     LiveOptions,
 )
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Voice Assistant API - Streaming", version="5.0.0")
+app = FastAPI(title="Voice Assistant API - Streaming", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,22 +59,22 @@ if not DEEPGRAM_API_KEY or not DEEPSEEK_API_KEY:
 dg_config = DeepgramClientOptions(options={"keepalive": "true"})
 deepgram = DeepgramClient(DEEPGRAM_API_KEY, dg_config)
 
-# Configure DeepSeek client (OpenAI-compatible API)
-deepseek_client = OpenAI(
+# Configure DeepSeek client (OpenAI-compatible API) - ASYNC VERSION
+deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
 
-# TTS Configuration - OPTIMIZED
+# TTS Configuration - OPTIMIZED FOR LOW LATENCY
 TTS_MODEL = "aura-2-thalia-en"
 TTS_SAMPLE_RATE = 24000
 TTS_ENCODING = "linear16"
-SEND_EVERY_CHARS = 50  # Reduced from 180 for faster first audio
+SEND_EVERY_CHARS = 15  # Reduced from 50 for faster first audio
 
 # System prompt - OPTIMIZED for shorter responses
 SYSTEM_PROMPT = (
     "You are a succinct, helpful voice assistant. "
-    "Respond in 3-4 sentences. Be direct and friendly."
+    "Respond in 2-3 sentences. Be direct and friendly."
 )
 
 
@@ -105,6 +105,9 @@ class StreamingSession:
         
         # Persistent TTS WebSocket state
         self.tts_connected = False
+        
+        # Audio buffer for handling speech during playback
+        self.pending_audio_buffer: list[bytes] = []
         
     async def send_message(self, msg_type: str, data: dict = None):
         """Send a JSON message to the frontend."""
@@ -159,6 +162,11 @@ class StreamingSession:
             async def on_speech_started(self_conn, speech_started, **kwargs):
                 logger.info(f"[{self.session_id}] STT | Speech started")
                 await self.send_message("speech_started")
+                
+                # If user starts speaking while assistant is speaking, stop playback
+                if self.is_speaking:
+                    logger.info(f"[{self.session_id}] STT | User barged in - stopping playback")
+                    await self.handle_barge_in()
             
             async def on_utterance_end(self_conn, utterance_end, **kwargs):
                 logger.info(f"[{self.session_id}] STT | Utterance end detected")
@@ -181,16 +189,16 @@ class StreamingSession:
             self.dg_connection.on(LiveTranscriptionEvents.Error, on_error)
             self.dg_connection.on(LiveTranscriptionEvents.Close, on_close)
             
-            # Configure live transcription options with VAD
+            # Configure live transcription options with VAD - OPTIMIZED TIMING
             options = LiveOptions(
                 model="nova-3",
                 language="en-US",
                 smart_format=True,
                 punctuate=True,
                 interim_results=True,
-                utterance_end_ms=2000,  # Reduced from 3000 for faster response
+                utterance_end_ms=2000,  # Reduced from 2000 for faster response
                 vad_events=True,
-                endpointing=300,  # Reduced from 500 for faster endpoint detection
+                endpointing=200,  # Reduced from 300 for faster endpoint detection
             )
             
             # Start the connection
@@ -209,12 +217,26 @@ class StreamingSession:
             await self.send_message("error", {"message": f"Failed to start STT: {str(e)}"})
             return False
     
+    async def handle_barge_in(self):
+        """Handle user interruption (barge-in) during assistant playback."""
+        self.is_speaking = False
+        self.first_audio_logged = False
+        
+        # Clear the TTS queue
+        while not self.tts_token_queue.empty():
+            try:
+                self.tts_token_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        
+        # Notify frontend to stop playback
+        await self.send_message("stop_playback")
+        logger.info(f"[{self.session_id}] BARGE-IN | Playback interrupted by user")
+    
     async def send_audio_to_stt(self, audio_data: bytes):
         """Forward audio data to Deepgram STT stream."""
-        # Skip sending audio while assistant is speaking to prevent feedback
-        if self.is_speaking:
-            return
-            
+        # Always accept audio - don't drop during playback
+        # Let barge-in detection handle interruptions
         if self.dg_connection:
             try:
                 await self.dg_connection.send(audio_data)
@@ -235,7 +257,9 @@ class StreamingSession:
             
             self.tts_websocket = await websockets.connect(
                 tts_url,
-                extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+                extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                ping_interval=20,
+                ping_timeout=10
             )
             
             self.tts_connected = True
@@ -252,21 +276,18 @@ class StreamingSession:
             return False
     
     async def tts_sender_for_response(self):
-        """Send tokens for a single response. Runs per-response, not per-session."""
+        """Send tokens for a single response with minimal batching for low latency."""
         buffer = []
+        chars_in_buffer = 0
         
         try:
             while self.is_active and self.tts_websocket:
                 try:
-                    # Wait for token with timeout
-                    tok = await asyncio.wait_for(self.tts_token_queue.get(), timeout=0.1)
-                    
-                    # Hold off while still speaking previous response
-                    while self.is_speaking:
-                        await asyncio.sleep(0.05)
+                    # Wait for token with short timeout for responsiveness
+                    tok = await asyncio.wait_for(self.tts_token_queue.get(), timeout=0.05)
                     
                     if tok == "[[FLUSH]]":
-                        # Send remaining buffer
+                        # Send remaining buffer immediately
                         if buffer:
                             text = "".join(buffer)
                             await self.tts_websocket.send(json.dumps({
@@ -275,27 +296,38 @@ class StreamingSession:
                             }))
                             logger.info(f"[{self.session_id}] TTS | Sent final batch: '{text[:50]}...'")
                             buffer.clear()
+                            chars_in_buffer = 0
                         
                         # Send Flush command
                         await self.tts_websocket.send(json.dumps({"type": "Flush"}))
                         logger.info(f"[{self.session_id}] TTS | Sent Flush command")
-                        self.is_speaking = True  # Block further input
                         return  # Exit sender for this response
                     else:
                         buffer.append(tok)
+                        chars_in_buffer += len(tok)
                         
-                        # Micro-batch: send when buffer reaches threshold (REDUCED for faster first audio)
-                        total_chars = sum(len(t) for t in buffer)
-                        if total_chars >= SEND_EVERY_CHARS:
+                        # Send batch when threshold reached - smaller for faster first audio
+                        if chars_in_buffer >= SEND_EVERY_CHARS:
                             text = "".join(buffer)
                             await self.tts_websocket.send(json.dumps({
                                 "type": "Speak",
                                 "text": text
                             }))
-                            logger.info(f"[{self.session_id}] TTS | Sent batch: '{text[:50]}...'")
+                            logger.info(f"[{self.session_id}] TTS | Sent batch ({chars_in_buffer} chars): '{text[:30]}...'")
                             buffer.clear()
+                            chars_in_buffer = 0
                             
                 except asyncio.TimeoutError:
+                    # Send any accumulated buffer on timeout to reduce latency
+                    if buffer and chars_in_buffer >= 5:  # Minimum viable chunk
+                        text = "".join(buffer)
+                        await self.tts_websocket.send(json.dumps({
+                            "type": "Speak",
+                            "text": text
+                        }))
+                        logger.info(f"[{self.session_id}] TTS | Sent timeout batch: '{text[:30]}...'")
+                        buffer.clear()
+                        chars_in_buffer = 0
                     continue
                     
         except Exception as e:
@@ -304,12 +336,12 @@ class StreamingSession:
     async def tts_receiver(self):
         """Receive audio chunks from TTS WebSocket - RUNS FOR ENTIRE SESSION."""
         last_audio_ts = time.perf_counter()
-        queue_empty_wait = 0.25  # 250ms of silence indicates playback done
+        queue_empty_wait = 0.20  # Reduced from 250ms for faster detection
         
         try:
             while self.is_active and self.tts_websocket:
                 try:
-                    msg = await asyncio.wait_for(self.tts_websocket.recv(), timeout=0.1)
+                    msg = await asyncio.wait_for(self.tts_websocket.recv(), timeout=0.05)
                     
                     # Handle control frames (JSON)
                     if isinstance(msg, str):
@@ -339,7 +371,7 @@ class StreamingSession:
                         
                         last_audio_ts = time.perf_counter()
                         
-                        # Send audio chunk to frontend
+                        # Send audio chunk to frontend immediately
                         audio_base64 = base64.b64encode(msg).decode('utf-8')
                         await self.send_message("audio_chunk", {
                             "audio": audio_base64,
@@ -348,7 +380,7 @@ class StreamingSession:
                         })
                         
                 except asyncio.TimeoutError:
-                    # Check if playback is finished (no audio for 250ms after first audio)
+                    # Check if playback is finished (no audio for 200ms after first audio)
                     if self.first_audio_logged and self.is_speaking:
                         silence_duration = time.perf_counter() - last_audio_ts
                         if silence_duration > queue_empty_wait:
@@ -429,8 +461,8 @@ class StreamingSession:
             # Start sender task for this response
             sender_task = asyncio.create_task(self.tts_sender_for_response())
             
-            # Stream LLM response and pipe to TTS
-            await self.stream_llm_to_tts(transcript)
+            # Stream LLM response and pipe to TTS (fully async)
+            await self.stream_llm_to_tts_async(transcript)
             
             # Wait for sender to complete
             await sender_task
@@ -442,31 +474,33 @@ class StreamingSession:
             self.is_processing = False
             self.final_transcript = ""
     
-    async def stream_llm_to_tts(self, user_input: str):
-        """Stream LLM response tokens directly to TTS queue."""
+    async def stream_llm_to_tts_async(self, user_input: str):
+        """Stream LLM response tokens directly to TTS queue - FULLY ASYNC."""
         try:
             full_response = ""
             self.llm_start_ts = time.perf_counter()
             
-            logger.info(f"[{self.session_id}] LLM | Starting stream...")
+            logger.info(f"[{self.session_id}] LLM | Starting async stream...")
             
-            # Use DeepSeek via OpenAI-compatible API with streaming
-            def get_stream():
-                return deepseek_client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_input}
-                    ],
-                    stream=True,
-                    temperature=0.4  # Lower temperature for faster, more consistent responses
-                )
+            # Use DeepSeek via AsyncOpenAI with async streaming
+            response_stream = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input}
+                ],
+                stream=True,
+                temperature=0.4  # Lower temperature for faster, more consistent responses
+            )
             
-            response_stream = await asyncio.to_thread(get_stream)
-            
-            # Iterate over streaming response
-            for chunk in response_stream:
+            # Async iteration over streaming response
+            async for chunk in response_stream:
                 if not self.is_active:
+                    break
+                
+                # Check for barge-in and stop processing if user interrupted
+                if not self.is_processing:
+                    logger.info(f"[{self.session_id}] LLM | Stopping due to barge-in")
                     break
                 
                 # Extract text from OpenAI-style streaming response
@@ -483,19 +517,19 @@ class StreamingSession:
                     # Send token to frontend for live display
                     await self.send_message("llm_token", {"text": text})
                     
-                    # Push token to TTS queue
+                    # Push token to TTS queue immediately
                     await self.tts_token_queue.put(text)
             
             # Signal TTS to flush remaining buffer
             await self.tts_token_queue.put("[[FLUSH]]")
             
-            logger.info(f"[{self.session_id}] LLM | Response complete: '{full_response}'")
+            logger.info(f"[{self.session_id}] LLM | Response complete: '{full_response[:100]}...'")
             
             # Send response complete signal
             await self.send_message("llm_complete", {"text": full_response})
             
         except Exception as e:
-            logger.error(f"[{self.session_id}] LLM | Error in stream: {e}")
+            logger.error(f"[{self.session_id}] LLM | Error in async stream: {e}")
             await self.send_message("error", {"message": f"LLM error: {str(e)}"})
             # Still need to flush TTS
             await self.tts_token_queue.put("[[FLUSH]]")
