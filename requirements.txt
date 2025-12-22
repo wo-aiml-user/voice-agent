@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart==0.0.6
+deepgram-sdk>=3.0.0
+openai>=1.0.0
+python-dotenv==1.0.0
+aiofiles==23.2.1
+pydub
+requests==2.31.0
+numpy
+websockets
+PyAudio==0.2.14
