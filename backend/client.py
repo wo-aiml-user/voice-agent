@@ -48,7 +48,7 @@ deepseek_client = AsyncOpenAI(
 TTS_MODEL = "aura-2-thalia-en"
 TTS_SAMPLE_RATE = 24000
 TTS_ENCODING = "linear16"
-SEND_EVERY_CHARS = 15  # Micro-batch size for faster first audio
+SEND_EVERY_CHARS = 20  # Micro-batch size for faster first audio
 
 # LLM Configuration
 SYSTEM_PROMPT = (

@@ -124,7 +124,7 @@ class TTSManager:
                                 "type": "Speak",
                                 "text": text
                             }))
-                            logger.info(f"[{self.session_id}] TTS | Sent final batch: '{text[:50]}...'")
+                            logger.info(f"[{self.session_id}] TTS | Sent final batch: '{text}'")
                             buffer.clear()
                             chars_in_buffer = 0
                         
@@ -143,7 +143,7 @@ class TTSManager:
                                 "type": "Speak",
                                 "text": text
                             }))
-                            logger.info(f"[{self.session_id}] TTS | Sent batch ({chars_in_buffer} chars): '{text[:30]}...'")
+                            logger.info(f"[{self.session_id}] TTS | Sent batch ({chars_in_buffer} chars): '{text}'")
                             buffer.clear()
                             chars_in_buffer = 0
                             
@@ -155,7 +155,7 @@ class TTSManager:
                             "type": "Speak",
                             "text": text
                         }))
-                        logger.info(f"[{self.session_id}] TTS | Sent timeout batch: '{text[:30]}...'")
+                        logger.info(f"[{self.session_id}] TTS | Sent timeout batch: '{text}'")
                         buffer.clear()
                         chars_in_buffer = 0
                     continue
